@@ -22,7 +22,9 @@ let aircraftCache: CacheEntry<AircraftPoint[]> | undefined;
 let satelliteCache: CacheEntry<SatellitePoint[]> | undefined;
 
 const WEATHER_TTL = 15 * 60 * 1000;
-const AIRCRAFT_TTL = 20 * 1000;
+// Anonymous global OpenSky requests cost four credits; this stays within the
+// documented 400-credit daily allowance for a continuously running instance.
+const AIRCRAFT_TTL = 15 * 60 * 1000;
 const SATELLITE_TTL = 2 * 60 * 60 * 1000;
 
 async function cached<T>(
