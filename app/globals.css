@@ -130,6 +130,7 @@ body {
 }
 
 .earth-scene__readout,
+.earth-scene__sources,
 .earth-scene__hint {
   position: absolute;
   z-index: 4;
@@ -140,6 +141,22 @@ body {
   font-size: 10px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
+}
+
+.earth-scene__sources {
+  position: absolute;
+  z-index: 4;
+  right: 32px;
+  bottom: 52px;
+  display: grid;
+  justify-items: end;
+  gap: 4px;
+  color: rgb(190 218 216 / 54%);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  pointer-events: none;
 }
 
 .earth-scene__readout {
@@ -168,6 +185,11 @@ body {
 .status-dot--ready {
   box-shadow: 0 0 10px #72e0cc;
   background: #72e0cc;
+}
+
+.status-dot--partial {
+  box-shadow: 0 0 10px #efb25f;
+  background: #efb25f;
 }
 
 .status-dot--unsupported {

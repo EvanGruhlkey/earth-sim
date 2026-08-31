@@ -3,212 +3,128 @@
 import { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 
-const WEATHER_POINTS = 2_000_000;
-const AIRCRAFT_POINTS = 120_000;
-const SATELLITE_POINTS = 12_000;
-const TOTAL_POINTS = WEATHER_POINTS + AIRCRAFT_POINTS + SATELLITE_POINTS;
-const GOLDEN_ANGLE = Math.PI * (3 - Math.sqrt(5));
+type Point = { latitude: number; longitude: number; altitudeKm?: number };
+type WeatherPoint = Point & { temperature: number; cloudCover: number; windSpeed: number };
+type SourceResult<T> = { data: T; error: string | null };
+type LivePayload = {
+  updatedAt: string;
+  weather: SourceResult<WeatherPoint[]>;
+  aircraft: SourceResult<Point[]>;
+  satellites: SourceResult<Point[]>;
+};
+type Counts = { weather: number; aircraft: number; satellites: number };
+type SceneStatus = 'loading' | 'ready' | 'partial' | 'unsupported';
 
-type SceneStatus = 'loading' | 'ready' | 'unsupported';
-
-function fractional(value: number) {
-  return value - Math.floor(value);
+function globePosition(point: Point, baseRadius: number, altitudeScale = 0) {
+  const latitude = THREE.MathUtils.degToRad(point.latitude);
+  const longitude = THREE.MathUtils.degToRad(point.longitude);
+  const radius = baseRadius + Math.min(point.altitudeKm ?? 0, 40_000) * altitudeScale;
+  const latitudeRadius = Math.cos(latitude) * radius;
+  return new THREE.Vector3(
+    Math.cos(longitude) * latitudeRadius,
+    Math.sin(latitude) * radius,
+    -Math.sin(longitude) * latitudeRadius,
+  );
 }
 
-function deterministicRandom(index: number, salt: number) {
-  return fractional(Math.sin(index * 12.9898 + salt * 78.233) * 43758.5453);
-}
-
-function createWeatherLayer(pixelRatio: number) {
-  const positions = new Float32Array(WEATHER_POINTS * 3);
-  const intensity = new Float32Array(WEATHER_POINTS);
-
-  for (let index = 0; index < WEATHER_POINTS; index += 1) {
-    const y = 1 - (2 * (index + 0.5)) / WEATHER_POINTS;
-    const ringRadius = Math.sqrt(1 - y * y);
-    const longitude = index * GOLDEN_ANGLE;
-    const radius = 2.012 + deterministicRandom(index, 4) * 0.014;
-    const offset = index * 3;
-
-    positions[offset] = Math.cos(longitude) * ringRadius * radius;
-    positions[offset + 1] = y * radius;
-    positions[offset + 2] = Math.sin(longitude) * ringRadius * radius;
-
-    const band = Math.sin(longitude * 2.3 + y * 17);
-    const cell = Math.sin(longitude * 7.1 - y * 31);
-    intensity[index] = Math.max(0, Math.min(1, band * 0.28 + cell * 0.22 + 0.5));
-  }
-
+function createPointLayer(
+  points: Point[],
+  pixelRatio: number,
+  options: { color: number; size: number; radius: number; altitudeScale?: number; opacity?: number },
+) {
+  const positions = new Float32Array(points.length * 3);
+  points.forEach((point, index) => {
+    globePosition(point, options.radius, options.altitudeScale).toArray(positions, index * 3);
+  });
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('aIntensity', new THREE.BufferAttribute(intensity, 1));
-
-  const material = new THREE.ShaderMaterial({
-    transparent: true,
-    depthWrite: false,
-    blending: THREE.AdditiveBlending,
-    uniforms: {
-      uTime: { value: 0 },
-      uPixelRatio: { value: pixelRatio },
-    },
-    vertexShader: `
-      attribute float aIntensity;
-      uniform float uTime;
-      uniform float uPixelRatio;
-      varying float vIntensity;
-
-      mat3 rotateY(float angle) {
-        float c = cos(angle);
-        float s = sin(angle);
-        return mat3(c, 0.0, -s, 0.0, 1.0, 0.0, s, 0.0, c);
-      }
-
-      void main() {
-        float latitude = normalize(position).y;
-        float flow = uTime * (0.006 + aIntensity * 0.005) * (1.0 - abs(latitude) * 0.35);
-        vec3 animatedPosition = rotateY(flow) * position;
-        vec4 mvPosition = modelViewMatrix * vec4(animatedPosition, 1.0);
-        gl_Position = projectionMatrix * mvPosition;
-        gl_PointSize = (0.62 + aIntensity * 0.92) * uPixelRatio;
-        vIntensity = aIntensity;
-      }
-    `,
-    fragmentShader: `
-      varying float vIntensity;
-
-      void main() {
-        vec2 centered = gl_PointCoord - vec2(0.5);
-        float alpha = smoothstep(0.5, 0.08, length(centered));
-        vec3 cool = vec3(0.12, 0.71, 0.72);
-        vec3 warm = vec3(0.96, 0.62, 0.24);
-        vec3 color = mix(cool, warm, smoothstep(0.47, 0.9, vIntensity));
-        gl_FragColor = vec4(color, alpha * (0.18 + vIntensity * 0.38));
-      }
-    `,
-  });
-
-  const points = new THREE.Points(geometry, material);
-  points.frustumCulled = false;
-  points.name = 'weather';
-  return { points, material };
+  return new THREE.Points(
+    geometry,
+    new THREE.PointsMaterial({
+      color: options.color,
+      size: options.size * pixelRatio,
+      sizeAttenuation: false,
+      transparent: true,
+      opacity: options.opacity ?? 0.85,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }),
+  );
 }
 
-function createAircraftLayer(pixelRatio: number) {
-  const positions = new Float32Array(AIRCRAFT_POINTS * 3);
-
-  for (let index = 0; index < AIRCRAFT_POINTS; index += 1) {
-    const longitude = deterministicRandom(index, 9) * Math.PI * 2;
-    const latitudeSample =
-      deterministicRandom(index, 11) +
-      deterministicRandom(index, 13) +
-      deterministicRandom(index, 15) -
-      1.5;
-    const latitude = latitudeSample * 0.94;
-    const radius = 2.035 + deterministicRandom(index, 17) * 0.012;
-    const latitudeRadius = Math.cos(latitude) * radius;
-    const offset = index * 3;
-
-    positions[offset] = Math.cos(longitude) * latitudeRadius;
-    positions[offset + 1] = Math.sin(latitude) * radius;
-    positions[offset + 2] = Math.sin(longitude) * latitudeRadius;
-  }
-
+function createWeatherLayer(points: WeatherPoint[], pixelRatio: number) {
+  const positions = new Float32Array(points.length * 3);
+  const colors = new Float32Array(points.length * 3);
+  const cool = new THREE.Color(0x35c7d0);
+  const warm = new THREE.Color(0xff9a3d);
+  points.forEach((point, index) => {
+    globePosition(point, 2.025).toArray(positions, index * 3);
+    const temperatureMix = THREE.MathUtils.clamp((point.temperature + 30) / 70, 0, 1);
+    cool.clone().lerp(warm, temperatureMix).multiplyScalar(0.65 + point.cloudCover / 285)
+      .toArray(colors, index * 3);
+  });
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-
-  const material = new THREE.PointsMaterial({
-    color: 0xffbd66,
-    size: 1.28 * pixelRatio,
-    sizeAttenuation: false,
-    transparent: true,
-    opacity: 0.82,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
-  });
-
-  const points = new THREE.Points(geometry, material);
-  points.frustumCulled = false;
-  points.name = 'aircraft';
-  return points;
+  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return new THREE.Points(
+    geometry,
+    new THREE.PointsMaterial({
+      vertexColors: true,
+      size: 4.4 * pixelRatio,
+      sizeAttenuation: false,
+      transparent: true,
+      opacity: 0.9,
+      blending: THREE.AdditiveBlending,
+      depthWrite: false,
+    }),
+  );
 }
 
-function createSatelliteLayer(pixelRatio: number) {
-  const positions = new Float32Array(SATELLITE_POINTS * 3);
-
-  for (let index = 0; index < SATELLITE_POINTS; index += 1) {
-    const plane = index % 72;
-    const phase = (index / SATELLITE_POINTS) * Math.PI * 2 * 43;
-    const inclination = 0.35 + (plane % 12) * 0.095;
-    const ascendingNode = (plane / 72) * Math.PI * 2;
-    const altitude = 2.16 + (plane % 9) * 0.035;
-    const orbitalX = Math.cos(phase) * altitude;
-    const orbitalY = Math.sin(phase) * altitude;
-    const offset = index * 3;
-
-    positions[offset] =
-      Math.cos(ascendingNode) * orbitalX -
-      Math.sin(ascendingNode) * Math.cos(inclination) * orbitalY;
-    positions[offset + 1] = Math.sin(inclination) * orbitalY;
-    positions[offset + 2] =
-      Math.sin(ascendingNode) * orbitalX +
-      Math.cos(ascendingNode) * Math.cos(inclination) * orbitalY;
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-
-  const material = new THREE.PointsMaterial({
-    color: 0xd9f7ff,
-    size: 1.45 * pixelRatio,
-    sizeAttenuation: false,
-    transparent: true,
-    opacity: 0.74,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
+function disposeLayers(group: THREE.Group) {
+  group.traverse((object) => {
+    if (object instanceof THREE.Points) {
+      object.geometry.dispose();
+      (Array.isArray(object.material) ? object.material : [object.material])
+        .forEach((material) => material.dispose());
+    }
   });
-
-  const points = new THREE.Points(geometry, material);
-  points.frustumCulled = false;
-  points.name = 'satellites';
-  return points;
+  group.clear();
 }
 
 function createEarthSurface() {
-  const geometry = new THREE.SphereGeometry(1.985, 128, 96);
-  const material = new THREE.ShaderMaterial({
-    vertexShader: `
-      varying vec3 vNormal;
-      varying vec3 vViewPosition;
-
-      void main() {
-        vNormal = normalize(normalMatrix * normal);
-        vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
-        vViewPosition = viewPosition.xyz;
-        gl_Position = projectionMatrix * viewPosition;
-      }
-    `,
-    fragmentShader: `
-      varying vec3 vNormal;
-      varying vec3 vViewPosition;
-
-      void main() {
-        vec3 normal = normalize(vNormal);
-        vec3 viewDirection = normalize(-vViewPosition);
-        float fresnel = pow(1.0 - max(dot(normal, viewDirection), 0.0), 2.6);
-        float longitude = atan(normal.z, normal.x) / 6.2831853 + 0.5;
-        float latitude = asin(clamp(normal.y, -1.0, 1.0)) / 3.1415926 + 0.5;
-        float longitudeLine = 1.0 - smoothstep(0.0, 0.035, abs(fract(longitude * 24.0) - 0.5));
-        float latitudeLine = 1.0 - smoothstep(0.0, 0.035, abs(fract(latitude * 12.0) - 0.5));
-        float grid = max(longitudeLine, latitudeLine) * 0.14;
-        vec3 base = vec3(0.012, 0.055, 0.072);
-        vec3 gridColor = vec3(0.08, 0.38, 0.42) * grid;
-        vec3 atmosphere = vec3(0.08, 0.55, 0.62) * fresnel * 0.5;
-        gl_FragColor = vec4(base + gridColor + atmosphere, 1.0);
-      }
-    `,
-  });
-
-  return new THREE.Mesh(geometry, material);
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(1.985, 128, 96),
+    new THREE.ShaderMaterial({
+      vertexShader: `
+        varying vec3 vNormal;
+        varying vec3 vViewPosition;
+        void main() {
+          vNormal = normalize(normalMatrix * normal);
+          vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
+          vViewPosition = viewPosition.xyz;
+          gl_Position = projectionMatrix * viewPosition;
+        }
+      `,
+      fragmentShader: `
+        varying vec3 vNormal;
+        varying vec3 vViewPosition;
+        void main() {
+          vec3 normal = normalize(vNormal);
+          vec3 viewDirection = normalize(-vViewPosition);
+          float fresnel = pow(1.0 - max(dot(normal, viewDirection), 0.0), 2.6);
+          float longitude = atan(normal.z, normal.x) / 6.2831853 + 0.5;
+          float latitude = asin(clamp(normal.y, -1.0, 1.0)) / 3.1415926 + 0.5;
+          float longitudeLine = 1.0 - smoothstep(0.0, 0.035, abs(fract(longitude * 24.0) - 0.5));
+          float latitudeLine = 1.0 - smoothstep(0.0, 0.035, abs(fract(latitude * 12.0) - 0.5));
+          float grid = max(longitudeLine, latitudeLine) * 0.14;
+          vec3 base = vec3(0.012, 0.055, 0.072);
+          vec3 gridColor = vec3(0.08, 0.38, 0.42) * grid;
+          vec3 atmosphere = vec3(0.08, 0.55, 0.62) * fresnel * 0.5;
+          gl_FragColor = vec4(base + gridColor + atmosphere, 1.0);
+        }
+      `,
+    }),
+  );
 }
 
 function createAtmosphere() {
@@ -239,47 +155,70 @@ function createAtmosphere() {
 
 export function EarthScene() {
   const hostRef = useRef<HTMLDivElement>(null);
+  const layersRef = useRef<THREE.Group | null>(null);
+  const pixelRatioRef = useRef(1);
   const [status, setStatus] = useState<SceneStatus>('loading');
-  const [fps, setFps] = useState(0);
+  const [counts, setCounts] = useState<Counts>({ weather: 0, aircraft: 0, satellites: 0 });
+  const [updatedAt, setUpdatedAt] = useState<string>();
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const response = await fetch('/api/live');
+        if (!response.ok) throw new Error(`Live data returned ${response.status}`);
+        const payload = (await response.json()) as LivePayload;
+        if (cancelled || !layersRef.current) return;
+        const layers = layersRef.current;
+        disposeLayers(layers);
+        layers.add(
+          createWeatherLayer(payload.weather.data, pixelRatioRef.current),
+          createPointLayer(payload.aircraft.data, pixelRatioRef.current, {
+            color: 0xffbd66, size: 1.35, radius: 2.038, altitudeScale: 0.000002,
+          }),
+          createPointLayer(payload.satellites.data, pixelRatioRef.current, {
+            color: 0xd9f7ff, size: 1.55, radius: 2.08, altitudeScale: 0.000035, opacity: 0.78,
+          }),
+        );
+        setCounts({
+          weather: payload.weather.data.length,
+          aircraft: payload.aircraft.data.length,
+          satellites: payload.satellites.data.length,
+        });
+        setUpdatedAt(payload.updatedAt);
+        setStatus(payload.weather.error || payload.aircraft.error || payload.satellites.error ? 'partial' : 'ready');
+      } catch {
+        if (!cancelled) setStatus('partial');
+      }
+    };
+    void load();
+    const interval = window.setInterval(load, 60_000);
+    return () => { cancelled = true; window.clearInterval(interval); };
+  }, []);
 
   useEffect(() => {
     const host = hostRef.current;
     if (!host) return;
-
     const canvas = document.createElement('canvas');
-    const context = canvas.getContext('webgl2', {
-      alpha: false,
-      antialias: false,
-      powerPreference: 'high-performance',
-    });
-
-    if (!context) {
-      queueMicrotask(() => setStatus('unsupported'));
-      return;
-    }
-
+    const context = canvas.getContext('webgl2', { alpha: false, antialias: false, powerPreference: 'high-performance' });
+    if (!context) { queueMicrotask(() => setStatus('unsupported')); return; }
     host.appendChild(canvas);
     const renderer = new THREE.WebGLRenderer({ canvas, context, antialias: false });
     const pixelRatio = Math.min(window.devicePixelRatio, 1.6);
+    pixelRatioRef.current = pixelRatio;
     renderer.setPixelRatio(pixelRatio);
     renderer.setClearColor(0x03080b, 1);
     renderer.outputColorSpace = THREE.SRGBColorSpace;
-
     const scene = new THREE.Scene();
     const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
     camera.position.set(0, 0.15, 6.7);
-
     const globe = new THREE.Group();
     globe.rotation.set(-0.12, -0.58, -0.18);
+    globe.add(createEarthSurface(), createAtmosphere());
+    const layers = new THREE.Group();
+    layersRef.current = layers;
+    globe.add(layers);
     scene.add(globe);
-
-    globe.add(createEarthSurface());
-    globe.add(createAtmosphere());
-
-    const weather = createWeatherLayer(pixelRatio);
-    const aircraft = createAircraftLayer(pixelRatio);
-    const satellites = createSatelliteLayer(pixelRatio);
-    globe.add(weather.points, aircraft, satellites);
 
     let pointerDown = false;
     let previousX = 0;
@@ -288,74 +227,44 @@ export function EarthScene() {
     let velocityY = 0;
     let cameraDistance = 6.7;
     let animationFrame = 0;
-    let lastFrame = performance.now();
-    let statsStarted = lastFrame;
-    let frames = 0;
-
     const resize = () => {
-      const width = host.clientWidth;
-      const height = host.clientHeight;
-      renderer.setSize(width, height, false);
-      camera.aspect = width / Math.max(height, 1);
+      renderer.setSize(host.clientWidth, host.clientHeight, false);
+      camera.aspect = host.clientWidth / Math.max(host.clientHeight, 1);
       camera.updateProjectionMatrix();
     };
-
     const onPointerDown = (event: PointerEvent) => {
-      pointerDown = true;
-      previousX = event.clientX;
-      previousY = event.clientY;
-      canvas.setPointerCapture(event.pointerId);
-      canvas.classList.add('is-grabbing');
+      pointerDown = true; previousX = event.clientX; previousY = event.clientY;
+      canvas.setPointerCapture(event.pointerId); canvas.classList.add('is-grabbing');
     };
-
     const onPointerMove = (event: PointerEvent) => {
       if (!pointerDown) return;
       velocityX = (event.clientX - previousX) * 0.0038;
       velocityY = (event.clientY - previousY) * 0.0038;
       globe.rotation.y += velocityX;
       globe.rotation.x = THREE.MathUtils.clamp(globe.rotation.x + velocityY, -1.25, 1.25);
-      previousX = event.clientX;
-      previousY = event.clientY;
+      previousX = event.clientX; previousY = event.clientY;
     };
-
     const onPointerUp = (event: PointerEvent) => {
       pointerDown = false;
       if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
       canvas.classList.remove('is-grabbing');
     };
-
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       cameraDistance = THREE.MathUtils.clamp(cameraDistance + event.deltaY * 0.0025, 4.65, 9.4);
     };
-
+    let lastFrame = performance.now();
     const render = (now: number) => {
-      const delta = Math.min((now - lastFrame) / 1000, 0.05);
-      lastFrame = now;
-      frames += 1;
-
+      const delta = Math.min((now - lastFrame) / 1000, 0.05); lastFrame = now;
       if (!pointerDown) {
         globe.rotation.y += 0.022 * delta + velocityX;
         globe.rotation.x = THREE.MathUtils.clamp(globe.rotation.x + velocityY, -1.25, 1.25);
-        velocityX *= 0.93;
-        velocityY *= 0.93;
+        velocityX *= 0.93; velocityY *= 0.93;
       }
-
       camera.position.z = THREE.MathUtils.lerp(camera.position.z, cameraDistance, 0.09);
-      weather.material.uniforms.uTime.value = now / 1000;
-      satellites.rotation.y = now * 0.000012;
-      aircraft.rotation.y = now * 0.000004;
       renderer.render(scene, camera);
-
-      if (now - statsStarted >= 750) {
-        setFps(Math.round((frames * 1000) / (now - statsStarted)));
-        frames = 0;
-        statsStarted = now;
-      }
-
       animationFrame = requestAnimationFrame(render);
     };
-
     const observer = new ResizeObserver(resize);
     observer.observe(host);
     canvas.addEventListener('pointerdown', onPointerDown);
@@ -363,13 +272,10 @@ export function EarthScene() {
     canvas.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('pointercancel', onPointerUp);
     canvas.addEventListener('wheel', onWheel, { passive: false });
-    resize();
-    queueMicrotask(() => setStatus('ready'));
-    animationFrame = requestAnimationFrame(render);
-
+    resize(); animationFrame = requestAnimationFrame(render);
     return () => {
-      cancelAnimationFrame(animationFrame);
-      observer.disconnect();
+      layersRef.current = null;
+      cancelAnimationFrame(animationFrame); observer.disconnect();
       canvas.removeEventListener('pointerdown', onPointerDown);
       canvas.removeEventListener('pointermove', onPointerMove);
       canvas.removeEventListener('pointerup', onPointerUp);
@@ -378,22 +284,29 @@ export function EarthScene() {
       scene.traverse((object) => {
         if (object instanceof THREE.Mesh || object instanceof THREE.Points) {
           object.geometry.dispose();
-          const materials = Array.isArray(object.material) ? object.material : [object.material];
-          materials.forEach((material) => material.dispose());
+          (Array.isArray(object.material) ? object.material : [object.material]).forEach((material) => material.dispose());
         }
       });
-      renderer.dispose();
-      canvas.remove();
+      renderer.dispose(); canvas.remove();
     };
   }, []);
 
+  const total = counts.weather + counts.aircraft + counts.satellites;
   return (
-    <div ref={hostRef} className="earth-scene" aria-label="Interactive real-time Earth data globe">
+    <div ref={hostRef} className="earth-scene" aria-label="Interactive live Earth data globe">
       <div className="earth-scene__readout" aria-live="polite">
         <span className={`status-dot status-dot--${status}`} />
-        {status === 'loading' && 'Allocating GPU buffers'}
-        {status === 'ready' && `${TOTAL_POINTS.toLocaleString()} points · ${fps || '—'} FPS`}
+        {status === 'loading' && 'Loading live sources'}
         {status === 'unsupported' && 'WebGL 2 is required'}
+        {(status === 'ready' || status === 'partial') && (
+          <>{total.toLocaleString()} live points · {status === 'partial' ? 'some sources unavailable' : 'all sources online'}</>
+        )}
+      </div>
+      <div className="earth-scene__sources">
+        <span>Weather {counts.weather.toLocaleString()} · Open-Meteo</span>
+        <span>Aircraft {counts.aircraft.toLocaleString()} · OpenSky</span>
+        <span>Satellites {counts.satellites.toLocaleString()} · CelesTrak</span>
+        {updatedAt && <time dateTime={updatedAt}>Updated {new Date(updatedAt).toLocaleTimeString()}</time>}
       </div>
       <p className="earth-scene__hint">Drag to orbit · Scroll to zoom</p>
     </div>
