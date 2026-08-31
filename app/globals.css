@@ -348,3 +348,136 @@ body {
     @apply font-sans;
   }
 }
+
+/* Minimal globe interface */
+.simulator-shell {
+  min-height: 100svh;
+  overflow: hidden;
+  background: #000;
+}
+
+.earth-scene__title,
+.earth-scene__live,
+.layer-panel {
+  position: absolute;
+  z-index: 5;
+}
+
+.earth-scene__title {
+  top: 28px;
+  left: 30px;
+  margin: 0;
+  color: #f7f7f7;
+  font-size: 22px;
+  font-weight: 450;
+  letter-spacing: -0.02em;
+}
+
+.earth-scene__live {
+  top: 31px;
+  right: 32px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: rgb(255 255 255 / 82%);
+  font-size: 14px;
+}
+
+.earth-scene__live time {
+  margin-left: 8px;
+  color: rgb(255 255 255 / 58%);
+  font-variant-numeric: tabular-nums;
+}
+
+.earth-scene__live .status-dot {
+  width: 7px;
+  height: 7px;
+  background: #39db70;
+  box-shadow: 0 0 8px rgb(57 219 112 / 65%);
+}
+
+.layer-panel {
+  bottom: 34px;
+  left: 30px;
+  width: 238px;
+  overflow: hidden;
+  border: 1px solid rgb(255 255 255 / 14%);
+  border-radius: 13px;
+  background: rgb(12 15 20 / 78%);
+  box-shadow: 0 14px 44px rgb(0 0 0 / 35%);
+  backdrop-filter: blur(18px);
+}
+
+.layer-control {
+  display: grid;
+  grid-template-columns: 24px 1fr auto 40px;
+  align-items: center;
+  gap: 9px;
+  width: 100%;
+  height: 58px;
+  padding: 0 17px;
+  border: 0;
+  border-bottom: 1px solid rgb(255 255 255 / 10%);
+  background: transparent;
+  color: rgb(255 255 255 / 88%);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.layer-control:last-child {
+  border-bottom: 0;
+}
+
+.layer-control:hover {
+  background: rgb(255 255 255 / 4%);
+}
+
+.layer-control > svg {
+  width: 19px;
+  height: 19px;
+  stroke-width: 1.7;
+}
+
+.layer-control small {
+  color: rgb(255 255 255 / 34%);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+}
+
+.layer-toggle {
+  position: relative;
+  width: 39px;
+  height: 23px;
+  border-radius: 999px;
+  background: rgb(255 255 255 / 18%);
+  transition: background 160ms ease;
+}
+
+.layer-toggle::after {
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 17px;
+  height: 17px;
+  border-radius: 50%;
+  background: white;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 40%);
+  transition: transform 160ms ease;
+  content: '';
+}
+
+.layer-toggle.is-on {
+  background: #2379f4;
+}
+
+.layer-toggle.is-on::after {
+  transform: translateX(16px);
+}
+
+@media (max-width: 640px) {
+  .earth-scene__title { top: 20px; left: 20px; }
+  .earth-scene__live { top: 23px; right: 20px; }
+  .layer-panel { right: 20px; bottom: 20px; left: 20px; width: auto; }
+  .layer-control { height: 50px; }
+}

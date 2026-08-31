@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
+import { Cloud, Plane, Satellite } from 'lucide-react';
 import * as THREE from 'three';
 
 type Point = { latitude: number; longitude: number; altitudeKm?: number };
@@ -91,39 +92,56 @@ function disposeLayers(group: THREE.Group) {
   group.clear();
 }
 
-function createEarthSurface() {
+function createEarthSurface(renderer: THREE.WebGLRenderer) {
+  const loader = new THREE.TextureLoader();
+  const diffuse = loader.load('/earth-diffuse.jpg');
+  const normal = loader.load('/earth-normal.jpg');
+  const specular = loader.load('/earth-specular.jpg');
+  diffuse.colorSpace = THREE.SRGBColorSpace;
+  diffuse.anisotropy = renderer.capabilities.getMaxAnisotropy();
   return new THREE.Mesh(
     new THREE.SphereGeometry(1.985, 128, 96),
-    new THREE.ShaderMaterial({
-      vertexShader: `
-        varying vec3 vNormal;
-        varying vec3 vViewPosition;
-        void main() {
-          vNormal = normalize(normalMatrix * normal);
-          vec4 viewPosition = modelViewMatrix * vec4(position, 1.0);
-          vViewPosition = viewPosition.xyz;
-          gl_Position = projectionMatrix * viewPosition;
-        }
-      `,
-      fragmentShader: `
-        varying vec3 vNormal;
-        varying vec3 vViewPosition;
-        void main() {
-          vec3 normal = normalize(vNormal);
-          vec3 viewDirection = normalize(-vViewPosition);
-          float fresnel = pow(1.0 - max(dot(normal, viewDirection), 0.0), 2.6);
-          float longitude = atan(normal.z, normal.x) / 6.2831853 + 0.5;
-          float latitude = asin(clamp(normal.y, -1.0, 1.0)) / 3.1415926 + 0.5;
-          float longitudeLine = 1.0 - smoothstep(0.0, 0.035, abs(fract(longitude * 24.0) - 0.5));
-          float latitudeLine = 1.0 - smoothstep(0.0, 0.035, abs(fract(latitude * 12.0) - 0.5));
-          float grid = max(longitudeLine, latitudeLine) * 0.14;
-          vec3 base = vec3(0.012, 0.055, 0.072);
-          vec3 gridColor = vec3(0.08, 0.38, 0.42) * grid;
-          vec3 atmosphere = vec3(0.08, 0.55, 0.62) * fresnel * 0.5;
-          gl_FragColor = vec4(base + gridColor + atmosphere, 1.0);
-        }
-      `,
+    new THREE.MeshPhongMaterial({
+      map: diffuse,
+      normalMap: normal,
+      normalScale: new THREE.Vector2(0.65, 0.65),
+      specularMap: specular,
+      specular: new THREE.Color(0x506b83),
+      shininess: 18,
     }),
+  );
+}
+
+function createClouds() {
+  const texture = new THREE.TextureLoader().load('/earth-clouds.png');
+  texture.colorSpace = THREE.SRGBColorSpace;
+  return new THREE.Mesh(
+    new THREE.SphereGeometry(2.003, 128, 96),
+    new THREE.MeshPhongMaterial({
+      map: texture,
+      transparent: true,
+      opacity: 0.55,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
+    }),
+  );
+}
+
+function createStars() {
+  const positions = new Float32Array(1_800 * 3);
+  for (let index = 0; index < 1_800; index += 1) {
+    const radius = 28 + Math.random() * 35;
+    const theta = Math.random() * Math.PI * 2;
+    const phi = Math.acos(2 * Math.random() - 1);
+    positions[index * 3] = radius * Math.sin(phi) * Math.cos(theta);
+    positions[index * 3 + 1] = radius * Math.cos(phi);
+    positions[index * 3 + 2] = radius * Math.sin(phi) * Math.sin(theta);
+  }
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  return new THREE.Points(
+    geometry,
+    new THREE.PointsMaterial({ color: 0xc9d7e8, size: 0.65, sizeAttenuation: false, opacity: 0.65, transparent: true }),
   );
 }
 
@@ -156,10 +174,16 @@ function createAtmosphere() {
 export function EarthScene() {
   const hostRef = useRef<HTMLDivElement>(null);
   const layersRef = useRef<THREE.Group | null>(null);
+  const layerObjectsRef = useRef<THREE.Object3D[]>([]);
   const pixelRatioRef = useRef(1);
   const [status, setStatus] = useState<SceneStatus>('loading');
   const [counts, setCounts] = useState<Counts>({ weather: 0, aircraft: 0, satellites: 0 });
   const [updatedAt, setUpdatedAt] = useState<string>();
+  const [visibleLayers, setVisibleLayers] = useState([true, true, true]);
+
+  useEffect(() => {
+    layerObjectsRef.current.forEach((layer, index) => { layer.visible = visibleLayers[index]; });
+  }, [visibleLayers]);
 
   useEffect(() => {
     let cancelled = false;
@@ -171,15 +195,18 @@ export function EarthScene() {
         if (cancelled || !layersRef.current) return;
         const layers = layersRef.current;
         disposeLayers(layers);
-        layers.add(
+        const layerObjects = [
           createWeatherLayer(payload.weather.data, pixelRatioRef.current),
+          createPointLayer(payload.satellites.data, pixelRatioRef.current, {
+            color: 0xd9f7ff, size: 1.8, radius: 2.08, altitudeScale: 0.000035, opacity: 0.88,
+          }),
           createPointLayer(payload.aircraft.data, pixelRatioRef.current, {
             color: 0xffbd66, size: 1.35, radius: 2.038, altitudeScale: 0.000002,
           }),
-          createPointLayer(payload.satellites.data, pixelRatioRef.current, {
-            color: 0xd9f7ff, size: 1.55, radius: 2.08, altitudeScale: 0.000035, opacity: 0.78,
-          }),
-        );
+        ];
+        layerObjects.forEach((layer, index) => { layer.visible = visibleLayers[index]; });
+        layerObjectsRef.current = layerObjects;
+        layers.add(...layerObjects);
         setCounts({
           weather: payload.weather.data.length,
           aircraft: payload.aircraft.data.length,
@@ -194,7 +221,7 @@ export function EarthScene() {
     void load();
     const interval = window.setInterval(load, 60_000);
     return () => { cancelled = true; window.clearInterval(interval); };
-  }, []);
+  }, [visibleLayers]);
 
   useEffect(() => {
     const host = hostRef.current;
@@ -214,11 +241,17 @@ export function EarthScene() {
     camera.position.set(0, 0.15, 6.7);
     const globe = new THREE.Group();
     globe.rotation.set(-0.12, -0.58, -0.18);
-    globe.add(createEarthSurface(), createAtmosphere());
+    const earth = createEarthSurface(renderer);
+    const clouds = createClouds();
+    globe.add(earth, clouds, createAtmosphere());
     const layers = new THREE.Group();
     layersRef.current = layers;
     globe.add(layers);
-    scene.add(globe);
+    scene.add(globe, createStars());
+    scene.add(new THREE.HemisphereLight(0x8eb8e8, 0x02040a, 0.72));
+    const sunlight = new THREE.DirectionalLight(0xffffff, 2.8);
+    sunlight.position.set(-4, 2.2, 5);
+    scene.add(sunlight);
 
     let pointerDown = false;
     let previousX = 0;
@@ -230,6 +263,7 @@ export function EarthScene() {
     const resize = () => {
       renderer.setSize(host.clientWidth, host.clientHeight, false);
       camera.aspect = host.clientWidth / Math.max(host.clientHeight, 1);
+      cameraDistance = camera.aspect < 0.9 ? 8.4 : 6.7;
       camera.updateProjectionMatrix();
     };
     const onPointerDown = (event: PointerEvent) => {
@@ -262,6 +296,7 @@ export function EarthScene() {
         velocityX *= 0.93; velocityY *= 0.93;
       }
       camera.position.z = THREE.MathUtils.lerp(camera.position.z, cameraDistance, 0.09);
+      clouds.rotation.y += 0.000025;
       renderer.render(scene, camera);
       animationFrame = requestAnimationFrame(render);
     };
@@ -294,21 +329,35 @@ export function EarthScene() {
   const total = counts.weather + counts.aircraft + counts.satellites;
   return (
     <div ref={hostRef} className="earth-scene" aria-label="Interactive live Earth data globe">
-      <div className="earth-scene__readout" aria-live="polite">
+      <h1 className="earth-scene__title">Earth</h1>
+      <div className="earth-scene__live" aria-live="polite">
         <span className={`status-dot status-dot--${status}`} />
-        {status === 'loading' && 'Loading live sources'}
+        {status === 'loading' && 'Loading'}
         {status === 'unsupported' && 'WebGL 2 is required'}
-        {(status === 'ready' || status === 'partial') && (
-          <>{total.toLocaleString()} live points · {status === 'partial' ? 'some sources unavailable' : 'all sources online'}</>
+        {(status === 'ready' || status === 'partial') && <>Live</>}
+        {updatedAt && (
+          <time dateTime={updatedAt}>
+            {new Date(updatedAt).toLocaleTimeString([], {
+              hour: '2-digit', minute: '2-digit', hour12: false, timeZone: 'UTC',
+            })} UTC
+          </time>
         )}
       </div>
-      <div className="earth-scene__sources">
-        <span>Weather {counts.weather.toLocaleString()} · Open-Meteo</span>
-        <span>Aircraft {counts.aircraft.toLocaleString()} · OpenSky</span>
-        <span>Satellites {counts.satellites.toLocaleString()} · CelesTrak</span>
-        {updatedAt && <time dateTime={updatedAt}>Updated {new Date(updatedAt).toLocaleTimeString()}</time>}
+      <div className="layer-panel">
+        {[
+          { label: 'Weather', icon: Cloud, count: counts.weather },
+          { label: 'Satellites', icon: Satellite, count: counts.satellites },
+          { label: 'Aircraft', icon: Plane, count: counts.aircraft },
+        ].map(({ label, icon: Icon, count }, index) => (
+          <button key={label} type="button" className="layer-control" onClick={() => setVisibleLayers((current) => current.map((value, item) => item === index ? !value : value))}>
+            <Icon aria-hidden="true" />
+            <span>{label}</span>
+            <small>{count.toLocaleString()}</small>
+            <span className={`layer-toggle${visibleLayers[index] ? ' is-on' : ''}`} aria-label={`${label} ${visibleLayers[index] ? 'on' : 'off'}`} />
+          </button>
+        ))}
       </div>
-      <p className="earth-scene__hint">Drag to orbit · Scroll to zoom</p>
+      <span className="sr-only">{total.toLocaleString()} live data points</span>
     </div>
   );
 }
