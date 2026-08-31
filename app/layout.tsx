@@ -13,7 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Untitled site',
+  title: 'Earth / Real-time orbital systems monitor',
+  description: 'GPU-powered Earth visualization for weather, satellite, and aircraft data.',
 };
 
 export default function RootLayout({
