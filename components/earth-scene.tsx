@@ -28,62 +28,99 @@ function globePosition(point: Point, baseRadius: number, altitudeScale = 0) {
   );
 }
 
-function createPointLayer(
-  points: Point[],
-  pixelRatio: number,
-  options: { color: number; size: number; radius: number; altitudeScale?: number; opacity?: number },
-) {
-  const positions = new Float32Array(points.length * 3);
-  points.forEach((point, index) => {
-    globePosition(point, options.radius, options.altitudeScale).toArray(positions, index * 3);
-  });
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  return new THREE.Points(
-    geometry,
-    new THREE.PointsMaterial({
-      color: options.color,
-      size: options.size * pixelRatio,
-      sizeAttenuation: false,
-      transparent: true,
-      opacity: options.opacity ?? 0.85,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    }),
-  );
+function surfaceTransform(point: Point, radius: number, altitudeScale = 0) {
+  const position = globePosition(point, radius, altitudeScale);
+  const normal = position.clone().normalize();
+  const quaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
+  return { position, quaternion };
 }
 
-function createWeatherLayer(points: WeatherPoint[], pixelRatio: number) {
-  const positions = new Float32Array(points.length * 3);
-  const colors = new Float32Array(points.length * 3);
+function createWeatherLayer(points: WeatherPoint[]) {
+  const geometry = new THREE.IcosahedronGeometry(1, 2);
+  const material = new THREE.MeshBasicMaterial({
+    transparent: true,
+    opacity: 0.38,
+    vertexColors: true,
+    blending: THREE.AdditiveBlending,
+    depthWrite: false,
+  });
+  const mesh = new THREE.InstancedMesh(geometry, material, points.length);
+  const matrix = new THREE.Matrix4();
   const cool = new THREE.Color(0x35c7d0);
   const warm = new THREE.Color(0xff9a3d);
   points.forEach((point, index) => {
-    globePosition(point, 2.025).toArray(positions, index * 3);
+    const { position, quaternion } = surfaceTransform(point, 2.025);
+    const spread = 0.035 + point.cloudCover * 0.00065 + point.windSpeed * 0.00035;
+    matrix.compose(position, quaternion, new THREE.Vector3(spread * 1.35, 0.008 + spread * 0.12, spread));
+    mesh.setMatrixAt(index, matrix);
     const temperatureMix = THREE.MathUtils.clamp((point.temperature + 30) / 70, 0, 1);
-    cool.clone().lerp(warm, temperatureMix).multiplyScalar(0.65 + point.cloudCover / 285)
-      .toArray(colors, index * 3);
+    mesh.setColorAt(index, cool.clone().lerp(warm, temperatureMix));
   });
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
-  return new THREE.Points(
-    geometry,
-    new THREE.PointsMaterial({
-      vertexColors: true,
-      size: 4.4 * pixelRatio,
-      sizeAttenuation: false,
-      transparent: true,
-      opacity: 0.9,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-    }),
+  mesh.instanceMatrix.needsUpdate = true;
+  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+  return mesh;
+}
+
+function createSatelliteLayer(points: Point[]) {
+  const stride = Math.max(1, Math.ceil(points.length / 72));
+  const rendered = points.filter((_, index) => index % stride === 0);
+  const group = new THREE.Group();
+  const body = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(0.018, 0.04, 0.018),
+    new THREE.MeshPhongMaterial({ color: 0xdce4e9, shininess: 70 }),
+    rendered.length,
   );
+  const panels = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(0.085, 0.005, 0.027),
+    new THREE.MeshPhongMaterial({ color: 0x2768c7, emissive: 0x082452, shininess: 90 }),
+    rendered.length,
+  );
+  const matrix = new THREE.Matrix4();
+  rendered.forEach((point, index) => {
+    const transform = surfaceTransform(point, 2.09, 0.000035);
+    matrix.compose(transform.position, transform.quaternion, new THREE.Vector3(1, 1, 1));
+    body.setMatrixAt(index, matrix);
+    panels.setMatrixAt(index, matrix);
+  });
+  body.instanceMatrix.needsUpdate = true;
+  panels.instanceMatrix.needsUpdate = true;
+  group.add(body, panels);
+  return group;
+}
+
+function createAircraftLayer(points: Point[]) {
+  const stride = Math.max(1, Math.ceil(points.length / 180));
+  const rendered = points.filter((_, index) => index % stride === 0);
+  const geometry = new THREE.BufferGeometry();
+  geometry.setAttribute('position', new THREE.Float32BufferAttribute([
+    0, 0.003, 0.065, -0.012, 0, -0.025, 0.012, 0, -0.025,
+    -0.012, 0, 0.005, -0.065, 0, -0.026, -0.012, 0, -0.035,
+    0.012, 0, 0.005, 0.012, 0, -0.035, 0.065, 0, -0.026,
+    -0.012, 0, -0.025, -0.027, 0, -0.055, 0, 0, -0.042,
+    0.012, 0, -0.025, 0, 0, -0.042, 0.027, 0, -0.055,
+  ], 3));
+  geometry.computeVertexNormals();
+  const mesh = new THREE.InstancedMesh(
+    geometry,
+    new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }),
+    rendered.length,
+  );
+  const matrix = new THREE.Matrix4();
+  const heading = new THREE.Quaternion();
+  rendered.forEach((point, index) => {
+    const transform = surfaceTransform(point, 2.045, 0.000002);
+    heading.setFromAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(point.longitude * 3 + point.latitude));
+    transform.quaternion.multiply(heading);
+    matrix.compose(transform.position, transform.quaternion, new THREE.Vector3(0.72, 0.72, 0.72));
+    mesh.setMatrixAt(index, matrix);
+  });
+  mesh.instanceMatrix.needsUpdate = true;
+  return mesh;
 }
 
 function disposeLayers(group: THREE.Group) {
   group.traverse((object) => {
-    if (object instanceof THREE.Points) {
+    if (object instanceof THREE.Points || object instanceof THREE.Mesh) {
       object.geometry.dispose();
       (Array.isArray(object.material) ? object.material : [object.material])
         .forEach((material) => material.dispose());
@@ -196,13 +233,9 @@ export function EarthScene() {
         const layers = layersRef.current;
         disposeLayers(layers);
         const layerObjects = [
-          createWeatherLayer(payload.weather.data, pixelRatioRef.current),
-          createPointLayer(payload.satellites.data, pixelRatioRef.current, {
-            color: 0xd9f7ff, size: 1.8, radius: 2.08, altitudeScale: 0.000035, opacity: 0.88,
-          }),
-          createPointLayer(payload.aircraft.data, pixelRatioRef.current, {
-            color: 0xffbd66, size: 1.35, radius: 2.038, altitudeScale: 0.000002,
-          }),
+          createWeatherLayer(payload.weather.data),
+          createSatelliteLayer(payload.satellites.data),
+          createAircraftLayer(payload.aircraft.data),
         ];
         layerObjects.forEach((layer, index) => { layer.visible = visibleLayers[index]; });
         layerObjectsRef.current = layerObjects;
