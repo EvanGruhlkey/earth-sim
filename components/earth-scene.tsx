@@ -50,24 +50,22 @@ function sample<T>(items: T[], maximum: number) {
   return items.filter((_, index) => index % stride === 0);
 }
 
-function recentGibsDate() {
-  return new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
+function recentPrecipitationTime() {
+  const observationTime = new Date(Date.now() - 9 * 60 * 60 * 1_000);
+  observationTime.setUTCMinutes(Math.floor(observationTime.getUTCMinutes() / 30) * 30, 0, 0);
+  return observationTime.toISOString().replace('.000Z', 'Z');
 }
 
 function createObservationLayer(viewer: Viewer) {
-  const date = recentGibsDate();
+  const observationTime = recentPrecipitationTime();
   const provider = new UrlTemplateImageryProvider({
-    url: `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${date}/250m/{z}/{y}/{x}.jpg`,
+    url: `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/IMERG_Precipitation_Rate_30min/default/${observationTime}/2km/{z}/{y}/{x}.png`,
     credit: 'NASA Global Imagery Browse Services (GIBS)',
     tilingScheme: new GeographicTilingScheme(),
-    maximumLevel: 6,
-    tileWidth: 512,
-    tileHeight: 512,
+    maximumLevel: 7,
   });
   const layer = viewer.imageryLayers.addImageryProvider(provider);
-  layer.alpha = 0.82;
-  layer.brightness = 0.86;
-  layer.contrast = 1.08;
+  layer.alpha = 0.68;
   return layer;
 }
 
