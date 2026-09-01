@@ -11,15 +11,17 @@ type AircraftPoint = {
   latitude: number;
   longitude: number;
   altitudeKm: number;
+  heading: number;
+  velocity: number;
+  verticalRate: number;
+  observedAt: number;
 };
-
-type SatellitePoint = AircraftPoint & { name: string };
 
 type CacheEntry<T> = { expiresAt: number; value: T };
 
 let weatherCache: CacheEntry<WeatherPoint[]> | undefined;
 let aircraftCache: CacheEntry<AircraftPoint[]> | undefined;
-let satelliteCache: CacheEntry<SatellitePoint[]> | undefined;
+let satelliteCache: CacheEntry<OrbitalElement[]> | undefined;
 
 const WEATHER_TTL = 15 * 60 * 1000;
 // Anonymous global OpenSky requests cost four credits; this stays within the
@@ -81,6 +83,10 @@ async function loadAircraft() {
       latitude,
       longitude,
       altitudeKm: typeof altitude === 'number' ? Math.max(altitude / 1000, 0) : 0,
+      heading: typeof state[10] === 'number' ? state[10] : 0,
+      velocity: typeof state[9] === 'number' ? state[9] : 0,
+      verticalRate: typeof state[11] === 'number' ? state[11] : 0,
+      observedAt: typeof state[3] === 'number' ? state[3] : Date.now() / 1000,
     }];
   });
 }
@@ -95,51 +101,14 @@ type OrbitalElement = {
   RA_OF_ASC_NODE: number;
   ARG_OF_PERICENTER: number;
   MEAN_ANOMALY: number;
+  EPHEMERIS_TYPE: number;
+  CLASSIFICATION_TYPE: string;
+  ELEMENT_SET_NO: number;
+  REV_AT_EPOCH?: number;
+  BSTAR: number;
+  MEAN_MOTION_DOT: number;
+  MEAN_MOTION_DDOT: number;
 };
-
-function satellitePosition(element: OrbitalElement, now: Date): SatellitePoint | null {
-  const meanMotion = Number(element.MEAN_MOTION);
-  const eccentricity = Number(element.ECCENTRICITY);
-  if (!meanMotion || !Number.isFinite(eccentricity)) return null;
-
-  const radians = Math.PI / 180;
-  const elapsedDays = (now.getTime() - new Date(element.EPOCH).getTime()) / 86_400_000;
-  const meanAnomaly = (Number(element.MEAN_ANOMALY) * radians + elapsedDays * meanMotion * Math.PI * 2) % (Math.PI * 2);
-  let eccentricAnomaly = meanAnomaly;
-  for (let iteration = 0; iteration < 6; iteration += 1) {
-    eccentricAnomaly = meanAnomaly + eccentricity * Math.sin(eccentricAnomaly);
-  }
-
-  const mu = 398600.4418;
-  const angularRate = (meanMotion * Math.PI * 2) / 86400;
-  const semiMajor = Math.cbrt(mu / (angularRate * angularRate));
-  const orbitalX = semiMajor * (Math.cos(eccentricAnomaly) - eccentricity);
-  const orbitalY = semiMajor * Math.sqrt(1 - eccentricity * eccentricity) * Math.sin(eccentricAnomaly);
-  const inclination = Number(element.INCLINATION) * radians;
-  const ascendingNode = Number(element.RA_OF_ASC_NODE) * radians;
-  const periapsis = Number(element.ARG_OF_PERICENTER) * radians;
-  const x1 = orbitalX * Math.cos(periapsis) - orbitalY * Math.sin(periapsis);
-  const y1 = orbitalX * Math.sin(periapsis) + orbitalY * Math.cos(periapsis);
-  const x = x1 * Math.cos(ascendingNode) - y1 * Math.cos(inclination) * Math.sin(ascendingNode);
-  const y = x1 * Math.sin(ascendingNode) + y1 * Math.cos(inclination) * Math.cos(ascendingNode);
-  const z = y1 * Math.sin(inclination);
-
-  const julianDate = now.getTime() / 86_400_000 + 2440587.5;
-  const centuries = (julianDate - 2451545) / 36525;
-  const siderealDegrees = 280.46061837 + 360.98564736629 * (julianDate - 2451545) + 0.000387933 * centuries * centuries;
-  const sidereal = siderealDegrees * radians;
-  const earthX = x * Math.cos(sidereal) + y * Math.sin(sidereal);
-  const earthY = -x * Math.sin(sidereal) + y * Math.cos(sidereal);
-  const radius = Math.sqrt(earthX * earthX + earthY * earthY + z * z);
-
-  return {
-    id: String(element.NORAD_CAT_ID),
-    name: element.OBJECT_NAME,
-    latitude: Math.asin(z / radius) / radians,
-    longitude: Math.atan2(earthY, earthX) / radians,
-    altitudeKm: Math.max(radius - 6371, 0),
-  };
-}
 
 async function loadSatellites() {
   const response = await fetch(
@@ -148,12 +117,7 @@ async function loadSatellites() {
   );
   if (!response.ok) throw new Error(`CelesTrak returned ${response.status}`);
   const elements = (await response.json()) as OrbitalElement[];
-  const now = new Date();
-  const stride = Math.max(1, Math.ceil(elements.length / 8_000));
-  return elements
-    .filter((_, index) => index % stride === 0)
-    .map((element) => satellitePosition(element, now))
-    .filter((point): point is SatellitePoint => point !== null);
+  return elements;
 }
 
 async function settle<T>(promise: Promise<T>) {

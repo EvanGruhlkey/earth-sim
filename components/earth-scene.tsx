@@ -3,41 +3,47 @@
 import { Cloud, Plane, Satellite } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import {
-  BillboardCollection,
+  eciToGeodetic,
+  gstime,
+  json2satrec,
+  propagate,
+  type OMMJsonObject,
+} from 'satellite.js';
+import {
+  CallbackPositionProperty,
   Cartesian3,
   Color,
+  CustomDataSource,
   GeographicTilingScheme,
   HeadingPitchRoll,
   ImageryLayer,
   SingleTileImageryProvider,
   UrlTemplateImageryProvider,
+  VelocityOrientationProperty,
   Viewer,
 } from 'cesium';
 
-type Point = { latitude: number; longitude: number; altitudeKm?: number };
+type Point = {
+  latitude: number;
+  longitude: number;
+  altitudeKm?: number;
+  heading?: number;
+  velocity?: number;
+  verticalRate?: number;
+  observedAt?: number;
+};
 type WeatherPoint = Point & { temperature: number; cloudCover: number; windSpeed: number };
+type OrbitalElement = OMMJsonObject & { OBJECT_NAME: string; NORAD_CAT_ID: string | number };
 type SourceResult<T> = { data: T; error: string | null };
 type LivePayload = {
   updatedAt: string;
   weather: SourceResult<WeatherPoint[]>;
   aircraft: SourceResult<Point[]>;
-  satellites: SourceResult<Point[]>;
+  satellites: SourceResult<OrbitalElement[]>;
 };
 type Counts = { weather: number; aircraft: number; satellites: number };
 type SceneStatus = 'loading' | 'ready' | 'partial' | 'unsupported';
 type ToggleableLayer = { show: boolean };
-
-const AIRCRAFT_ICON = `data:image/svg+xml,${encodeURIComponent(`
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
-    <path fill="white" d="M35 4l5 22 18 9v6l-18-4-2 17 7 5v3l-13-3-13 3v-3l7-5-2-17-18 4v-6l18-9 5-22z"/>
-  </svg>
-`)}`;
-
-const SATELLITE_ICON = `data:image/svg+xml,${encodeURIComponent(`
-  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 48">
-    <g stroke="#dce9f5" stroke-width="3"><path fill="#3478d4" d="M1 8h22v32H1zM49 8h22v32H49z"/><path fill="#dce9f5" d="M27 12h18v24H27z"/><path d="M23 24h4m18 0h4"/></g>
-  </svg>
-`)}`;
 
 function sample<T>(items: T[], maximum: number) {
   const stride = Math.max(1, Math.ceil(items.length / maximum));
@@ -65,31 +71,69 @@ function createObservationLayer(viewer: Viewer) {
   return layer;
 }
 
-function createBillboardLayer(
-  viewer: Viewer,
-  points: Point[],
-  maximum: number,
-  image: string,
-  size: { width: number; height: number },
-  altitudeScale: number,
-) {
-  const collection = new BillboardCollection({ scene: viewer.scene });
-  sample(points, maximum).forEach((point) => {
-    collection.add({
-      position: Cartesian3.fromDegrees(
-        point.longitude,
-        point.latitude,
-        Math.max(point.altitudeKm ?? 0, 1) * altitudeScale,
-      ),
-      image,
-      width: size.width,
-      height: size.height,
-      rotation: ((point.longitude * 3 + point.latitude) * Math.PI) / 180,
-      color: Color.WHITE.withAlpha(0.92),
-      disableDepthTestDistance: 3_000_000,
+function predictedAircraftPosition(point: Point, date: Date) {
+  const elapsed = Math.min(Math.max(date.getTime() / 1000 - (point.observedAt ?? 0), 0), 15 * 60);
+  const distance = (point.velocity ?? 0) * elapsed;
+  const bearing = ((point.heading ?? 0) * Math.PI) / 180;
+  const latitude = (point.latitude * Math.PI) / 180;
+  const longitude = (point.longitude * Math.PI) / 180;
+  const angularDistance = distance / 6_371_000;
+  const nextLatitude = Math.asin(
+    Math.sin(latitude) * Math.cos(angularDistance) +
+    Math.cos(latitude) * Math.sin(angularDistance) * Math.cos(bearing),
+  );
+  const nextLongitude = longitude + Math.atan2(
+    Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(latitude),
+    Math.cos(angularDistance) - Math.sin(latitude) * Math.sin(nextLatitude),
+  );
+  const altitude = Math.max((point.altitudeKm ?? 0) * 1_000 + (point.verticalRate ?? 0) * elapsed, 100);
+  return Cartesian3.fromRadians(nextLongitude, nextLatitude, altitude);
+}
+
+function createAircraftLayer(viewer: Viewer, points: Point[]) {
+  const dataSource = new CustomDataSource('aircraft');
+  sample(points, 36).forEach((point) => {
+    const position = new CallbackPositionProperty(() => predictedAircraftPosition(point, new Date()), false);
+    dataSource.entities.add({
+      position,
+      orientation: new VelocityOrientationProperty(position),
+      model: {
+        uri: '/aircraft.glb',
+        minimumPixelSize: 25,
+        maximumScale: 90_000,
+        scale: 1.25,
+      },
     });
   });
-  return viewer.scene.primitives.add(collection);
+  void viewer.dataSources.add(dataSource);
+  return dataSource;
+}
+
+function createSatelliteLayer(viewer: Viewer, elements: OrbitalElement[]) {
+  const dataSource = new CustomDataSource('satellites');
+  sample(elements, 24).forEach((element) => {
+    const record = json2satrec(element);
+    const position = new CallbackPositionProperty(() => {
+      const date = new Date();
+      const state = propagate(record, date);
+      if (!state) return Cartesian3.ZERO;
+      const geodetic = eciToGeodetic(state.position, gstime(date));
+      return Cartesian3.fromRadians(geodetic.longitude, geodetic.latitude, geodetic.height * 1_000);
+    }, false);
+    dataSource.entities.add({
+      name: element.OBJECT_NAME,
+      position,
+      orientation: new VelocityOrientationProperty(position),
+      model: {
+        uri: '/satellite.glb',
+        minimumPixelSize: 23,
+        maximumScale: 140_000,
+        scale: 1_200,
+      },
+    });
+  });
+  void viewer.dataSources.add(dataSource);
+  return dataSource;
 }
 
 function setInitialView(viewer: Viewer) {
@@ -149,9 +193,11 @@ export function EarthScene() {
     viewer.scene.globe.enableLighting = true;
     viewer.scene.globe.showGroundAtmosphere = true;
     viewer.scene.highDynamicRange = true;
-    viewer.scene.skyAtmosphere.hueShift = -0.03;
-    viewer.scene.skyAtmosphere.saturationShift = 0.08;
-    viewer.scene.skyAtmosphere.brightnessShift = -0.1;
+    if (viewer.scene.skyAtmosphere) {
+      viewer.scene.skyAtmosphere.hueShift = -0.03;
+      viewer.scene.skyAtmosphere.saturationShift = 0.08;
+      viewer.scene.skyAtmosphere.brightnessShift = -0.1;
+    }
     viewer.scene.screenSpaceCameraController.minimumZoomDistance = 6_500_000;
     viewer.scene.screenSpaceCameraController.maximumZoomDistance = 45_000_000;
     setInitialView(viewer);
@@ -174,10 +220,10 @@ export function EarthScene() {
         const payload = (await response.json()) as LivePayload;
         if (cancelled || viewer.isDestroyed()) return;
 
-        trackingLayersRef.current.forEach((layer) => viewer.scene.primitives.remove(layer as never));
+        trackingLayersRef.current.forEach((layer) => viewer.dataSources.remove(layer as CustomDataSource, true));
         const layers = [
-          createBillboardLayer(viewer, payload.satellites.data, 72, SATELLITE_ICON, { width: 34, height: 23 }, 1_000),
-          createBillboardLayer(viewer, payload.aircraft.data, 180, AIRCRAFT_ICON, { width: 19, height: 19 }, 1_000),
+          createSatelliteLayer(viewer, payload.satellites.data),
+          createAircraftLayer(viewer, payload.aircraft.data),
         ];
         layers.forEach((layer, index) => { layer.show = visibleLayersRef.current[index + 1]; });
         trackingLayersRef.current = layers;
