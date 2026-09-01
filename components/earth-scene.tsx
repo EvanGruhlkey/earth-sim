@@ -6,11 +6,11 @@ import {
   BillboardCollection,
   Cartesian3,
   Color,
+  GeographicTilingScheme,
   HeadingPitchRoll,
   ImageryLayer,
-  PointPrimitiveCollection,
   SingleTileImageryProvider,
-  Transforms,
+  UrlTemplateImageryProvider,
   Viewer,
 } from 'cesium';
 
@@ -44,25 +44,25 @@ function sample<T>(items: T[], maximum: number) {
   return items.filter((_, index) => index % stride === 0);
 }
 
-function weatherColor(point: WeatherPoint) {
-  const mix = Math.min(Math.max((point.temperature + 30) / 70, 0), 1);
-  return Color.lerp(Color.fromCssColorString('#35c7d0'), Color.fromCssColorString('#ff9a3d'), mix, new Color())
-    .withAlpha(0.5);
+function recentGibsDate() {
+  return new Date(Date.now() - 2 * 86_400_000).toISOString().slice(0, 10);
 }
 
-function createWeatherLayer(viewer: Viewer, points: WeatherPoint[]) {
-  const collection = new PointPrimitiveCollection();
-  points.forEach((point) => {
-    collection.add({
-      position: Cartesian3.fromDegrees(point.longitude, point.latitude, 18_000),
-      color: weatherColor(point),
-      outlineColor: weatherColor(point).withAlpha(0.18),
-      outlineWidth: 7,
-      pixelSize: 9 + point.cloudCover * 0.07 + point.windSpeed * 0.04,
-      disableDepthTestDistance: Number.POSITIVE_INFINITY,
-    });
+function createObservationLayer(viewer: Viewer) {
+  const date = recentGibsDate();
+  const provider = new UrlTemplateImageryProvider({
+    url: `https://gibs.earthdata.nasa.gov/wmts/epsg4326/best/VIIRS_SNPP_CorrectedReflectance_TrueColor/default/${date}/250m/{z}/{y}/{x}.jpg`,
+    credit: 'NASA Global Imagery Browse Services (GIBS)',
+    tilingScheme: new GeographicTilingScheme(),
+    maximumLevel: 6,
+    tileWidth: 512,
+    tileHeight: 512,
   });
-  return viewer.scene.primitives.add(collection);
+  const layer = viewer.imageryLayers.addImageryProvider(provider);
+  layer.alpha = 0.82;
+  layer.brightness = 0.86;
+  layer.contrast = 1.08;
+  return layer;
 }
 
 function createBillboardLayer(
@@ -102,7 +102,8 @@ function setInitialView(viewer: Viewer) {
 export function EarthScene() {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewerRef = useRef<Viewer | null>(null);
-  const layerObjectsRef = useRef<ToggleableLayer[]>([]);
+  const weatherLayerRef = useRef<ToggleableLayer | null>(null);
+  const trackingLayersRef = useRef<ToggleableLayer[]>([]);
   const visibleLayersRef = useRef([true, true, true]);
   const [status, setStatus] = useState<SceneStatus>('loading');
   const [counts, setCounts] = useState<Counts>({ weather: 0, aircraft: 0, satellites: 0 });
@@ -111,7 +112,8 @@ export function EarthScene() {
 
   useEffect(() => {
     visibleLayersRef.current = visibleLayers;
-    layerObjectsRef.current.forEach((layer, index) => { layer.show = visibleLayers[index]; });
+    if (weatherLayerRef.current) weatherLayerRef.current.show = visibleLayers[0];
+    trackingLayersRef.current.forEach((layer, index) => { layer.show = visibleLayers[index + 1]; });
     viewerRef.current?.scene.requestRender();
   }, [visibleLayers]);
 
@@ -156,6 +158,9 @@ export function EarthScene() {
     }).then((provider) => {
       if (!cancelled && !viewer.isDestroyed()) {
         viewer.imageryLayers.add(new ImageryLayer(provider));
+        const observationLayer = createObservationLayer(viewer);
+        observationLayer.show = visibleLayersRef.current[0];
+        weatherLayerRef.current = observationLayer;
       }
     });
 
@@ -166,14 +171,13 @@ export function EarthScene() {
         const payload = (await response.json()) as LivePayload;
         if (cancelled || viewer.isDestroyed()) return;
 
-        layerObjectsRef.current.forEach((layer) => viewer.scene.primitives.remove(layer as never));
+        trackingLayersRef.current.forEach((layer) => viewer.scene.primitives.remove(layer as never));
         const layers = [
-          createWeatherLayer(viewer, payload.weather.data),
           createBillboardLayer(viewer, payload.satellites.data, 72, SATELLITE_ICON, { width: 34, height: 23 }, 1_000),
           createBillboardLayer(viewer, payload.aircraft.data, 180, AIRCRAFT_ICON, { width: 19, height: 19 }, 1_000),
         ];
-        layers.forEach((layer, index) => { layer.show = visibleLayersRef.current[index]; });
-        layerObjectsRef.current = layers;
+        layers.forEach((layer, index) => { layer.show = visibleLayersRef.current[index + 1]; });
+        trackingLayersRef.current = layers;
         setCounts({
           weather: payload.weather.data.length,
           aircraft: payload.aircraft.data.length,
@@ -192,7 +196,8 @@ export function EarthScene() {
     return () => {
       cancelled = true;
       window.clearInterval(interval);
-      layerObjectsRef.current = [];
+      weatherLayerRef.current = null;
+      trackingLayersRef.current = [];
       viewerRef.current = null;
       if (!viewer.isDestroyed()) viewer.destroy();
     };
