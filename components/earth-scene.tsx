@@ -119,27 +119,30 @@ export function EarthScene() {
 
   useEffect(() => {
     const host = hostRef.current;
-    if (!host || !Viewer.isSupported()) {
+    if (!host) return;
+
+    let cancelled = false;
+    let viewer: Viewer;
+    try {
+      viewer = new Viewer(host, {
+        animation: false,
+        baseLayer: false,
+        baseLayerPicker: false,
+        fullscreenButton: false,
+        geocoder: false,
+        homeButton: false,
+        infoBox: false,
+        navigationHelpButton: false,
+        scene3DOnly: true,
+        sceneModePicker: false,
+        selectionIndicator: false,
+        timeline: false,
+        vrButton: false,
+      });
+    } catch {
       queueMicrotask(() => setStatus('unsupported'));
       return;
     }
-
-    let cancelled = false;
-    const viewer = new Viewer(host, {
-      animation: false,
-      baseLayer: false,
-      baseLayerPicker: false,
-      fullscreenButton: false,
-      geocoder: false,
-      homeButton: false,
-      infoBox: false,
-      navigationHelpButton: false,
-      scene3DOnly: true,
-      sceneModePicker: false,
-      selectionIndicator: false,
-      timeline: false,
-      vrButton: false,
-    });
     viewerRef.current = viewer;
     viewer.scene.backgroundColor = Color.BLACK;
     viewer.scene.globe.baseColor = Color.fromCssColorString('#06101c');
