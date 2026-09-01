@@ -1,4 +1,5 @@
 import type { Metadata } from 'next';
+import 'cesium/Build/Cesium/Widgets/widgets.css';
 import { Geist, Geist_Mono } from 'next/font/google';
 import './globals.css';
 

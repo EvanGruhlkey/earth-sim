@@ -1,8 +1,18 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
 import { Cloud, Plane, Satellite } from 'lucide-react';
-import * as THREE from 'three';
+import { useEffect, useRef, useState } from 'react';
+import {
+  BillboardCollection,
+  Cartesian3,
+  Color,
+  HeadingPitchRoll,
+  ImageryLayer,
+  PointPrimitiveCollection,
+  SingleTileImageryProvider,
+  Transforms,
+  Viewer,
+} from 'cesium';
 
 type Point = { latitude: number; longitude: number; altitudeKm?: number };
 type WeatherPoint = Point & { temperature: number; cloudCover: number; windSpeed: number };
@@ -15,231 +25,155 @@ type LivePayload = {
 };
 type Counts = { weather: number; aircraft: number; satellites: number };
 type SceneStatus = 'loading' | 'ready' | 'partial' | 'unsupported';
+type ToggleableLayer = { show: boolean };
 
-function globePosition(point: Point, baseRadius: number, altitudeScale = 0) {
-  const latitude = THREE.MathUtils.degToRad(point.latitude);
-  const longitude = THREE.MathUtils.degToRad(point.longitude);
-  const radius = baseRadius + Math.min(point.altitudeKm ?? 0, 40_000) * altitudeScale;
-  const latitudeRadius = Math.cos(latitude) * radius;
-  return new THREE.Vector3(
-    Math.cos(longitude) * latitudeRadius,
-    Math.sin(latitude) * radius,
-    -Math.sin(longitude) * latitudeRadius,
-  );
+const AIRCRAFT_ICON = `data:image/svg+xml,${encodeURIComponent(`
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+    <path fill="white" d="M35 4l5 22 18 9v6l-18-4-2 17 7 5v3l-13-3-13 3v-3l7-5-2-17-18 4v-6l18-9 5-22z"/>
+  </svg>
+`)}`;
+
+const SATELLITE_ICON = `data:image/svg+xml,${encodeURIComponent(`
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 48">
+    <g stroke="#dce9f5" stroke-width="3"><path fill="#3478d4" d="M1 8h22v32H1zM49 8h22v32H49z"/><path fill="#dce9f5" d="M27 12h18v24H27z"/><path d="M23 24h4m18 0h4"/></g>
+  </svg>
+`)}`;
+
+function sample<T>(items: T[], maximum: number) {
+  const stride = Math.max(1, Math.ceil(items.length / maximum));
+  return items.filter((_, index) => index % stride === 0);
 }
 
-function surfaceTransform(point: Point, radius: number, altitudeScale = 0) {
-  const position = globePosition(point, radius, altitudeScale);
-  const normal = position.clone().normalize();
-  const quaternion = new THREE.Quaternion().setFromUnitVectors(new THREE.Vector3(0, 1, 0), normal);
-  return { position, quaternion };
+function weatherColor(point: WeatherPoint) {
+  const mix = Math.min(Math.max((point.temperature + 30) / 70, 0), 1);
+  return Color.lerp(Color.fromCssColorString('#35c7d0'), Color.fromCssColorString('#ff9a3d'), mix, new Color())
+    .withAlpha(0.5);
 }
 
-function createWeatherLayer(points: WeatherPoint[]) {
-  const geometry = new THREE.IcosahedronGeometry(1, 2);
-  const material = new THREE.MeshBasicMaterial({
-    transparent: true,
-    opacity: 0.38,
-    vertexColors: true,
-    blending: THREE.AdditiveBlending,
-    depthWrite: false,
+function createWeatherLayer(viewer: Viewer, points: WeatherPoint[]) {
+  const collection = new PointPrimitiveCollection();
+  points.forEach((point) => {
+    collection.add({
+      position: Cartesian3.fromDegrees(point.longitude, point.latitude, 18_000),
+      color: weatherColor(point),
+      outlineColor: weatherColor(point).withAlpha(0.18),
+      outlineWidth: 7,
+      pixelSize: 9 + point.cloudCover * 0.07 + point.windSpeed * 0.04,
+      disableDepthTestDistance: Number.POSITIVE_INFINITY,
+    });
   });
-  const mesh = new THREE.InstancedMesh(geometry, material, points.length);
-  const matrix = new THREE.Matrix4();
-  const cool = new THREE.Color(0x35c7d0);
-  const warm = new THREE.Color(0xff9a3d);
-  points.forEach((point, index) => {
-    const { position, quaternion } = surfaceTransform(point, 2.025);
-    const spread = 0.035 + point.cloudCover * 0.00065 + point.windSpeed * 0.00035;
-    matrix.compose(position, quaternion, new THREE.Vector3(spread * 1.35, 0.008 + spread * 0.12, spread));
-    mesh.setMatrixAt(index, matrix);
-    const temperatureMix = THREE.MathUtils.clamp((point.temperature + 30) / 70, 0, 1);
-    mesh.setColorAt(index, cool.clone().lerp(warm, temperatureMix));
+  return viewer.scene.primitives.add(collection);
+}
+
+function createBillboardLayer(
+  viewer: Viewer,
+  points: Point[],
+  maximum: number,
+  image: string,
+  size: { width: number; height: number },
+  altitudeScale: number,
+) {
+  const collection = new BillboardCollection({ scene: viewer.scene });
+  sample(points, maximum).forEach((point) => {
+    collection.add({
+      position: Cartesian3.fromDegrees(
+        point.longitude,
+        point.latitude,
+        Math.max(point.altitudeKm ?? 0, 1) * altitudeScale,
+      ),
+      image,
+      width: size.width,
+      height: size.height,
+      rotation: ((point.longitude * 3 + point.latitude) * Math.PI) / 180,
+      color: Color.WHITE.withAlpha(0.92),
+      disableDepthTestDistance: 3_000_000,
+    });
   });
-  mesh.instanceMatrix.needsUpdate = true;
-  if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
-  return mesh;
+  return viewer.scene.primitives.add(collection);
 }
 
-function createSatelliteLayer(points: Point[]) {
-  const stride = Math.max(1, Math.ceil(points.length / 72));
-  const rendered = points.filter((_, index) => index % stride === 0);
-  const group = new THREE.Group();
-  const body = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(0.018, 0.04, 0.018),
-    new THREE.MeshPhongMaterial({ color: 0xdce4e9, shininess: 70 }),
-    rendered.length,
-  );
-  const panels = new THREE.InstancedMesh(
-    new THREE.BoxGeometry(0.085, 0.005, 0.027),
-    new THREE.MeshPhongMaterial({ color: 0x2768c7, emissive: 0x082452, shininess: 90 }),
-    rendered.length,
-  );
-  const matrix = new THREE.Matrix4();
-  rendered.forEach((point, index) => {
-    const transform = surfaceTransform(point, 2.09, 0.000035);
-    matrix.compose(transform.position, transform.quaternion, new THREE.Vector3(1, 1, 1));
-    body.setMatrixAt(index, matrix);
-    panels.setMatrixAt(index, matrix);
+function setInitialView(viewer: Viewer) {
+  viewer.camera.setView({
+    destination: Cartesian3.fromDegrees(-78, 18, 13_800_000),
+    orientation: new HeadingPitchRoll(0, -Math.PI / 2, 0),
   });
-  body.instanceMatrix.needsUpdate = true;
-  panels.instanceMatrix.needsUpdate = true;
-  group.add(body, panels);
-  return group;
-}
-
-function createAircraftLayer(points: Point[]) {
-  const stride = Math.max(1, Math.ceil(points.length / 180));
-  const rendered = points.filter((_, index) => index % stride === 0);
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.Float32BufferAttribute([
-    0, 0.003, 0.065, -0.012, 0, -0.025, 0.012, 0, -0.025,
-    -0.012, 0, 0.005, -0.065, 0, -0.026, -0.012, 0, -0.035,
-    0.012, 0, 0.005, 0.012, 0, -0.035, 0.065, 0, -0.026,
-    -0.012, 0, -0.025, -0.027, 0, -0.055, 0, 0, -0.042,
-    0.012, 0, -0.025, 0, 0, -0.042, 0.027, 0, -0.055,
-  ], 3));
-  geometry.computeVertexNormals();
-  const mesh = new THREE.InstancedMesh(
-    geometry,
-    new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide }),
-    rendered.length,
-  );
-  const matrix = new THREE.Matrix4();
-  const heading = new THREE.Quaternion();
-  rendered.forEach((point, index) => {
-    const transform = surfaceTransform(point, 2.045, 0.000002);
-    heading.setFromAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(point.longitude * 3 + point.latitude));
-    transform.quaternion.multiply(heading);
-    matrix.compose(transform.position, transform.quaternion, new THREE.Vector3(0.72, 0.72, 0.72));
-    mesh.setMatrixAt(index, matrix);
-  });
-  mesh.instanceMatrix.needsUpdate = true;
-  return mesh;
-}
-
-function disposeLayers(group: THREE.Group) {
-  group.traverse((object) => {
-    if (object instanceof THREE.Points || object instanceof THREE.Mesh) {
-      object.geometry.dispose();
-      (Array.isArray(object.material) ? object.material : [object.material])
-        .forEach((material) => material.dispose());
-    }
-  });
-  group.clear();
-}
-
-function createEarthSurface(renderer: THREE.WebGLRenderer) {
-  const loader = new THREE.TextureLoader();
-  const diffuse = loader.load('/earth-diffuse.jpg');
-  const normal = loader.load('/earth-normal.jpg');
-  const specular = loader.load('/earth-specular.jpg');
-  diffuse.colorSpace = THREE.SRGBColorSpace;
-  diffuse.anisotropy = renderer.capabilities.getMaxAnisotropy();
-  return new THREE.Mesh(
-    new THREE.SphereGeometry(1.985, 128, 96),
-    new THREE.MeshPhongMaterial({
-      map: diffuse,
-      normalMap: normal,
-      normalScale: new THREE.Vector2(0.65, 0.65),
-      specularMap: specular,
-      specular: new THREE.Color(0x506b83),
-      shininess: 18,
-    }),
-  );
-}
-
-function createClouds() {
-  const texture = new THREE.TextureLoader().load('/earth-clouds.png');
-  texture.colorSpace = THREE.SRGBColorSpace;
-  return new THREE.Mesh(
-    new THREE.SphereGeometry(2.003, 128, 96),
-    new THREE.MeshPhongMaterial({
-      map: texture,
-      transparent: true,
-      opacity: 0.55,
-      depthWrite: false,
-      blending: THREE.AdditiveBlending,
-    }),
-  );
-}
-
-function createStars() {
-  const positions = new Float32Array(1_800 * 3);
-  for (let index = 0; index < 1_800; index += 1) {
-    const radius = 28 + Math.random() * 35;
-    const theta = Math.random() * Math.PI * 2;
-    const phi = Math.acos(2 * Math.random() - 1);
-    positions[index * 3] = radius * Math.sin(phi) * Math.cos(theta);
-    positions[index * 3 + 1] = radius * Math.cos(phi);
-    positions[index * 3 + 2] = radius * Math.sin(phi) * Math.sin(theta);
-  }
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
-  return new THREE.Points(
-    geometry,
-    new THREE.PointsMaterial({ color: 0xc9d7e8, size: 0.65, sizeAttenuation: false, opacity: 0.65, transparent: true }),
-  );
-}
-
-function createAtmosphere() {
-  return new THREE.Mesh(
-    new THREE.SphereGeometry(2.07, 96, 64),
-    new THREE.ShaderMaterial({
-      side: THREE.BackSide,
-      transparent: true,
-      blending: THREE.AdditiveBlending,
-      depthWrite: false,
-      vertexShader: `
-        varying vec3 vNormal;
-        void main() {
-          vNormal = normalize(normalMatrix * normal);
-          gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-        }
-      `,
-      fragmentShader: `
-        varying vec3 vNormal;
-        void main() {
-          float rim = pow(0.72 - dot(vNormal, vec3(0.0, 0.0, 1.0)), 3.0);
-          gl_FragColor = vec4(0.08, 0.65, 0.76, rim * 0.34);
-        }
-      `,
-    }),
-  );
 }
 
 export function EarthScene() {
   const hostRef = useRef<HTMLDivElement>(null);
-  const layersRef = useRef<THREE.Group | null>(null);
-  const layerObjectsRef = useRef<THREE.Object3D[]>([]);
-  const pixelRatioRef = useRef(1);
+  const viewerRef = useRef<Viewer | null>(null);
+  const layerObjectsRef = useRef<ToggleableLayer[]>([]);
+  const visibleLayersRef = useRef([true, true, true]);
   const [status, setStatus] = useState<SceneStatus>('loading');
   const [counts, setCounts] = useState<Counts>({ weather: 0, aircraft: 0, satellites: 0 });
   const [updatedAt, setUpdatedAt] = useState<string>();
   const [visibleLayers, setVisibleLayers] = useState([true, true, true]);
 
   useEffect(() => {
-    layerObjectsRef.current.forEach((layer, index) => { layer.visible = visibleLayers[index]; });
+    visibleLayersRef.current = visibleLayers;
+    layerObjectsRef.current.forEach((layer, index) => { layer.show = visibleLayers[index]; });
+    viewerRef.current?.scene.requestRender();
   }, [visibleLayers]);
 
   useEffect(() => {
+    const host = hostRef.current;
+    if (!host || !Viewer.isSupported()) {
+      queueMicrotask(() => setStatus('unsupported'));
+      return;
+    }
+
     let cancelled = false;
+    const viewer = new Viewer(host, {
+      animation: false,
+      baseLayer: false,
+      baseLayerPicker: false,
+      fullscreenButton: false,
+      geocoder: false,
+      homeButton: false,
+      infoBox: false,
+      navigationHelpButton: false,
+      scene3DOnly: true,
+      sceneModePicker: false,
+      selectionIndicator: false,
+      timeline: false,
+      vrButton: false,
+    });
+    viewerRef.current = viewer;
+    viewer.scene.backgroundColor = Color.BLACK;
+    viewer.scene.globe.baseColor = Color.fromCssColorString('#06101c');
+    viewer.scene.globe.enableLighting = true;
+    viewer.scene.globe.showGroundAtmosphere = true;
+    viewer.scene.highDynamicRange = true;
+    viewer.scene.skyAtmosphere.hueShift = -0.03;
+    viewer.scene.skyAtmosphere.saturationShift = 0.08;
+    viewer.scene.skyAtmosphere.brightnessShift = -0.1;
+    viewer.scene.screenSpaceCameraController.minimumZoomDistance = 6_500_000;
+    viewer.scene.screenSpaceCameraController.maximumZoomDistance = 45_000_000;
+    setInitialView(viewer);
+
+    void SingleTileImageryProvider.fromUrl('/earth-diffuse.jpg', {
+      credit: 'Earth imagery: three.js project assets',
+    }).then((provider) => {
+      if (!cancelled && !viewer.isDestroyed()) {
+        viewer.imageryLayers.add(new ImageryLayer(provider));
+      }
+    });
+
     const load = async () => {
       try {
         const response = await fetch('/api/live');
         if (!response.ok) throw new Error(`Live data returned ${response.status}`);
         const payload = (await response.json()) as LivePayload;
-        if (cancelled || !layersRef.current) return;
-        const layers = layersRef.current;
-        disposeLayers(layers);
-        const layerObjects = [
-          createWeatherLayer(payload.weather.data),
-          createSatelliteLayer(payload.satellites.data),
-          createAircraftLayer(payload.aircraft.data),
+        if (cancelled || viewer.isDestroyed()) return;
+
+        layerObjectsRef.current.forEach((layer) => viewer.scene.primitives.remove(layer as never));
+        const layers = [
+          createWeatherLayer(viewer, payload.weather.data),
+          createBillboardLayer(viewer, payload.satellites.data, 72, SATELLITE_ICON, { width: 34, height: 23 }, 1_000),
+          createBillboardLayer(viewer, payload.aircraft.data, 180, AIRCRAFT_ICON, { width: 19, height: 19 }, 1_000),
         ];
-        layerObjects.forEach((layer, index) => { layer.visible = visibleLayers[index]; });
-        layerObjectsRef.current = layerObjects;
-        layers.add(...layerObjects);
+        layers.forEach((layer, index) => { layer.show = visibleLayersRef.current[index]; });
+        layerObjectsRef.current = layers;
         setCounts({
           weather: payload.weather.data.length,
           aircraft: payload.aircraft.data.length,
@@ -247,121 +181,27 @@ export function EarthScene() {
         });
         setUpdatedAt(payload.updatedAt);
         setStatus(payload.weather.error || payload.aircraft.error || payload.satellites.error ? 'partial' : 'ready');
+        viewer.scene.requestRender();
       } catch {
         if (!cancelled) setStatus('partial');
       }
     };
     void load();
     const interval = window.setInterval(load, 60_000);
-    return () => { cancelled = true; window.clearInterval(interval); };
-  }, [visibleLayers]);
 
-  useEffect(() => {
-    const host = hostRef.current;
-    if (!host) return;
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('webgl2', { alpha: false, antialias: false, powerPreference: 'high-performance' });
-    if (!context) { queueMicrotask(() => setStatus('unsupported')); return; }
-    host.appendChild(canvas);
-    const renderer = new THREE.WebGLRenderer({ canvas, context, antialias: false });
-    const pixelRatio = Math.min(window.devicePixelRatio, 1.6);
-    pixelRatioRef.current = pixelRatio;
-    renderer.setPixelRatio(pixelRatio);
-    renderer.setClearColor(0x03080b, 1);
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    const scene = new THREE.Scene();
-    const camera = new THREE.PerspectiveCamera(38, 1, 0.1, 100);
-    camera.position.set(0, 0.15, 6.7);
-    const globe = new THREE.Group();
-    globe.rotation.set(-0.12, -0.58, -0.18);
-    const earth = createEarthSurface(renderer);
-    const clouds = createClouds();
-    globe.add(earth, clouds, createAtmosphere());
-    const layers = new THREE.Group();
-    layersRef.current = layers;
-    globe.add(layers);
-    scene.add(globe, createStars());
-    scene.add(new THREE.HemisphereLight(0x8eb8e8, 0x02040a, 0.72));
-    const sunlight = new THREE.DirectionalLight(0xffffff, 2.8);
-    sunlight.position.set(-4, 2.2, 5);
-    scene.add(sunlight);
-
-    let pointerDown = false;
-    let previousX = 0;
-    let previousY = 0;
-    let velocityX = 0;
-    let velocityY = 0;
-    let cameraDistance = 6.7;
-    let animationFrame = 0;
-    const resize = () => {
-      renderer.setSize(host.clientWidth, host.clientHeight, false);
-      camera.aspect = host.clientWidth / Math.max(host.clientHeight, 1);
-      cameraDistance = camera.aspect < 0.9 ? 8.4 : 6.7;
-      camera.updateProjectionMatrix();
-    };
-    const onPointerDown = (event: PointerEvent) => {
-      pointerDown = true; previousX = event.clientX; previousY = event.clientY;
-      canvas.setPointerCapture(event.pointerId); canvas.classList.add('is-grabbing');
-    };
-    const onPointerMove = (event: PointerEvent) => {
-      if (!pointerDown) return;
-      velocityX = (event.clientX - previousX) * 0.0038;
-      velocityY = (event.clientY - previousY) * 0.0038;
-      globe.rotation.y += velocityX;
-      globe.rotation.x = THREE.MathUtils.clamp(globe.rotation.x + velocityY, -1.25, 1.25);
-      previousX = event.clientX; previousY = event.clientY;
-    };
-    const onPointerUp = (event: PointerEvent) => {
-      pointerDown = false;
-      if (canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
-      canvas.classList.remove('is-grabbing');
-    };
-    const onWheel = (event: WheelEvent) => {
-      event.preventDefault();
-      cameraDistance = THREE.MathUtils.clamp(cameraDistance + event.deltaY * 0.0025, 4.65, 9.4);
-    };
-    let lastFrame = performance.now();
-    const render = (now: number) => {
-      const delta = Math.min((now - lastFrame) / 1000, 0.05); lastFrame = now;
-      if (!pointerDown) {
-        globe.rotation.y += 0.022 * delta + velocityX;
-        globe.rotation.x = THREE.MathUtils.clamp(globe.rotation.x + velocityY, -1.25, 1.25);
-        velocityX *= 0.93; velocityY *= 0.93;
-      }
-      camera.position.z = THREE.MathUtils.lerp(camera.position.z, cameraDistance, 0.09);
-      clouds.rotation.y += 0.000025;
-      renderer.render(scene, camera);
-      animationFrame = requestAnimationFrame(render);
-    };
-    const observer = new ResizeObserver(resize);
-    observer.observe(host);
-    canvas.addEventListener('pointerdown', onPointerDown);
-    canvas.addEventListener('pointermove', onPointerMove);
-    canvas.addEventListener('pointerup', onPointerUp);
-    canvas.addEventListener('pointercancel', onPointerUp);
-    canvas.addEventListener('wheel', onWheel, { passive: false });
-    resize(); animationFrame = requestAnimationFrame(render);
     return () => {
-      layersRef.current = null;
-      cancelAnimationFrame(animationFrame); observer.disconnect();
-      canvas.removeEventListener('pointerdown', onPointerDown);
-      canvas.removeEventListener('pointermove', onPointerMove);
-      canvas.removeEventListener('pointerup', onPointerUp);
-      canvas.removeEventListener('pointercancel', onPointerUp);
-      canvas.removeEventListener('wheel', onWheel);
-      scene.traverse((object) => {
-        if (object instanceof THREE.Mesh || object instanceof THREE.Points) {
-          object.geometry.dispose();
-          (Array.isArray(object.material) ? object.material : [object.material]).forEach((material) => material.dispose());
-        }
-      });
-      renderer.dispose(); canvas.remove();
+      cancelled = true;
+      window.clearInterval(interval);
+      layerObjectsRef.current = [];
+      viewerRef.current = null;
+      if (!viewer.isDestroyed()) viewer.destroy();
     };
   }, []);
 
   const total = counts.weather + counts.aircraft + counts.satellites;
   return (
-    <div ref={hostRef} className="earth-scene" aria-label="Interactive live Earth data globe">
+    <div className="earth-scene-shell">
+      <div ref={hostRef} className="earth-scene" aria-label="Interactive live Earth data globe" />
       <h1 className="earth-scene__title">Earth</h1>
       <div className="earth-scene__live" aria-live="polite">
         <span className={`status-dot status-dot--${status}`} />
@@ -382,11 +222,17 @@ export function EarthScene() {
           { label: 'Satellites', icon: Satellite, count: counts.satellites },
           { label: 'Aircraft', icon: Plane, count: counts.aircraft },
         ].map(({ label, icon: Icon, count }, index) => (
-          <button key={label} type="button" className="layer-control" onClick={() => setVisibleLayers((current) => current.map((value, item) => item === index ? !value : value))}>
+          <button
+            key={label}
+            type="button"
+            className="layer-control"
+            aria-pressed={visibleLayers[index]}
+            onClick={() => setVisibleLayers((current) => current.map((value, item) => item === index ? !value : value))}
+          >
             <Icon aria-hidden="true" />
             <span>{label}</span>
             <small>{count.toLocaleString()}</small>
-            <span className={`layer-toggle${visibleLayers[index] ? ' is-on' : ''}`} aria-label={`${label} ${visibleLayers[index] ? 'on' : 'off'}`} />
+            <span className={`layer-toggle${visibleLayers[index] ? ' is-on' : ''}`} aria-hidden="true" />
           </button>
         ))}
       </div>
